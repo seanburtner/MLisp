@@ -1,4 +1,5 @@
-(* MLisp
+(* Sean Burtner (seb4jw)
+MLisp
  * -----
  *
  * MIT License
@@ -37,6 +38,7 @@ module Type = struct
     | String of string
     | Int of Int64.t (* Python integers have arbitrary precision
                       * but this is the closest we can get in OCaml *)
+    | Float of float
     | Bool of bool
     | List of t list
     | Fun of (t list -> t)
@@ -46,6 +48,7 @@ module Type = struct
     | Symbol s -> "'" ^ s (* Lisp symbols are often represented as 'symbol *)
     | String s -> s
     | Int n -> Int64.to_string n
+    | Float f -> Float.to_string f
     | Bool b -> string_of_bool b
     | List lst -> "[" ^ String.concat ", " (List.map to_string lst) ^ "]"
     | Fun _ -> "<fun>"
@@ -55,6 +58,7 @@ module Type = struct
     | Symbol s -> s
     | String s -> s
     | Int n -> Int64.to_string n
+    | Float f -> Float.to_string f
     | Bool b -> Bool.to_string b
     | List lst -> "(" ^ String.concat " " (List.map to_lispy lst) ^ ")"
     | Fun _ ->
@@ -65,6 +69,10 @@ module Type = struct
   let to_int = function
     | Int n -> n
     | _ -> raise (Invalid_argument "MLisp type error: expected Int")
+             
+  let to_float = function
+    | Float f -> f
+    | _ -> raise (Invalid_argument "MLisp type error: expected Float")
 
   let to_bool = function
     | Bool b -> b
@@ -76,6 +84,7 @@ module Type = struct
     | Symbol a, Symbol b -> String.equal a b
     | String a, String b -> String.equal a b
     | Int a, Int b -> Int64.equal a b
+    | Float a, Float b -> Float.equal a b
     | Bool a, Bool b -> Bool.equal a b
     | List a, List b -> list_equal a b
     | _ -> false
@@ -121,8 +130,8 @@ module Env = struct
       let () =
         Hashtbl.iter
           (fun key v ->
-            print_indent ();
-            Format.fprintf ppf "%s: %s\n" key (Type.to_string v))
+             print_indent ();
+             Format.fprintf ppf "%s: %s\n" key (Type.to_string v))
           env.self
       in
       let () =
@@ -160,28 +169,40 @@ let rec eval env = function
       let () = Env.put s (eval env exp) env in
       Nil
   | Type.List [ Type.Symbol "set!"; Symbol s; exp ] ->
-      let () = Env.put s (eval env exp) env in
+      (* Bug fix - instead of putting count in current env, find the env
+that has the count already defined, and evaluate + store in this env *)
+      let innermostEnv = match Env.find s env with
+        | None -> raise (Runtime_error ("Symbol " ^ s ^ " not found in env"))
+        | Some  e -> e
+      in
+      let () = Env.put s (eval innermostEnv exp) innermostEnv in
       Nil
   | Type.List [ Type.Symbol "lambda"; Type.List params; body ] ->
       Type.Fun
         (fun args ->
-          let evaled_params =
-            List.map
-              (fun param ->
-                match param with
-                | Type.Symbol s -> s
-                | _ -> raise (Runtime_error "Lambda parameter must be a symbol"))
-              params
-          in
-          let rec zip l1 l2 =
-            match (l1, l2) with
-            | [], [] -> []
-            | _ :: _, [] | [], _ :: _ ->
-                raise (Runtime_error "Lambda arguments do not match parameters")
-            | x1 :: x1s, x2 :: x2s -> (x1, x2) :: zip x1s x2s
-          in
-          let sub_env = Env.init (Some env) (zip evaled_params args) in
-          eval sub_env body)
+           let evaled_params =
+             List.map
+               (fun param ->
+                  match param with
+                  | Type.Symbol s -> s
+                  | _ -> raise (Runtime_error "Lambda parameter must be a symbol"))
+               params
+           in
+           let rec zip l1 l2 =
+             match (l1, l2) with
+             | [], [] -> []
+             | _ :: _, [] | [], _ :: _ ->
+                 raise (Runtime_error "Lambda arguments do not match parameters")
+             | x1 :: x1s, x2 :: x2s -> (x1, x2) :: zip x1s x2s
+           in
+           let sub_env = Env.init (Some env) (zip evaled_params args) in
+           eval sub_env body)
+  | Type.List [ Type.Symbol "and"; clause1; clause2 ] ->
+      if not(Type.is_truthy (eval env clause1)) then Type.Bool false
+      else (eval env clause2)
+  | Type.List [ Type.Symbol "or"; clause1; clause2 ] ->
+      if Type.is_truthy (eval env clause1) then Type.Bool true
+      else (eval env clause2)
   | Type.List (op :: args) -> (
       let proc = eval env op in
       match proc with
@@ -190,112 +211,191 @@ let rec eval env = function
   | ast -> ast
 
 (* TODO (#2) Implement apply:
- * Takes two arguments. The first argument is a function and the second argument
- * is a list of the arguments to that function.
- *
- * e.g.
- *  List [Symbol "apply"; Symbol "+"; List [Symbol "list"; Int 1L; Int 2L]]
- *  is interpreted as
- *  List [Symbol "+"; Int 1L; Int 2L] *)
-let apply_fun = raise Not_implemented
+* Takes two arguments. The first argument is a function and the second argument
+* is a list of the arguments to that function.
+*
+* e.g.
+*  List [Symbol "apply"; Symbol "+"; List [Symbol "list"; Int 1L; Int 2L]]
+*  is interpreted as
+*  [Symbol "+"; List [Symbol "list"; Int 1L; Int 2L]] *)
+let apply_fun = function
+  | [ Type.Fun f ; Type.List args ] -> f args
+  | _ -> raise (Runtime_error "Error calling apply_fun") 
 
 (* TODO (#2) Implement append:
- *   NOTE (lis.py's append function is Python's + operator
- *        which works for lists, strings, and numbers) *)
-let append_fun = raise Not_implemented
+*   NOTE (lis.py's append function is Python's + operator
+*        which works for lists, strings, and numbers) *)
+let append_fun = function
+  | [ Type.Int a; Type.Int b ] -> Type.Int (Int64.add a b)
+  | [ Type.Float a; Type.Float b ] -> Type.Float (Float.add a b)
+  | [ Type.String a; Type.String b ] -> Type.String (a ^ b)
+  | [ Type.List a; Type.List b ] -> Type.List (List.append a b)
+  | _ -> raise (Runtime_error "Error calling append_fun")
 
 (* TODO (#2) Implement car:
- *   NOTE raise an error if calling car on an empty list *)
-let car_fun = raise Not_implemented
+*   NOTE raise an error if calling car on an empty list *)
+let car_fun = function
+  | [ Type.List a ] -> ( match a with 
+      | [] -> raise (Runtime_error "Cannot call car_fun on empty list")
+      | x::_ -> x )
+  | _ -> raise (Runtime_error "Error calling car_fun")
 
 (* TODO (#2) Implement cdr:
- *   NOTE return an empty list if calling cdr on an empty list *)
-let cdr_fun = raise Not_implemented
+*   NOTE return an empty list if calling cdr on an empty list *)
+let cdr_fun = function
+  | [ Type.List a ] -> ( match a with 
+      | [] -> Type.List []
+      | _::xs -> Type.List xs )
+  | _ -> raise (Runtime_error "Error calling cdr_fun")
 
 (* TODO (#2) Implement cons: *)
-let cons_fun = raise Not_implemented
+let cons_fun = function
+  | [ a; Type.List b ] -> Type.List (a::b) 
+  | _ -> raise (Runtime_error "Error calling cons_fun")
 
 (* TODO (#2) Implement expt: *)
-let expt_fun = raise Not_implemented
+let expt_fun = function
+  | [ Type.Int a; Type.Int b ] -> Type.Int (
+      Int64.of_float (Int64.to_float a ** Int64.to_float b))
+  | [ Type.Int a; Type.Float b ] -> Type.Float (Int64.to_float a ** b)
+  | [ Type.Float a; Type.Int b ] -> Type.Float (a ** Int64.to_float b)
+  | [ Type.Float a; Type.Float b ] -> Type.Float (a ** b)
+  | _ -> raise (Runtime_error "Error calling expt_fun")
 
 (* TODO (#2) Implement length: *)
-let length_fun = raise Not_implemented
+let length_fun = function
+  | [ Type.List a ] -> Type.Int (Int64.of_int (List.length a))
+  | _ -> raise (Runtime_error "Error calling length_fun") 
 
 (* TODO (#2) Implement list?: *)
-let is_list_fun = raise Not_implemented
+let is_list_fun = function
+  | [ Type.List _ ] -> Type.Bool true
+  | _ -> Type.Bool false
 
 (* TODO (#2) Implement map: *)
-let map_fun = raise Not_implemented
+let map_fun = function
+  | [ Type.Fun f; Type.List args ] -> 
+      Type.List (List.fold_right (
+          fun inputElement -> fun acc -> (f [inputElement])::acc) args [])
+  | _ -> raise (Runtime_error "Error calling map_fun")
 
 (* TODO (#2) Implement max: *)
-let max_fun = raise Not_implemented
+let max_fun = function
+  | [ Type.Int a; Type.Int b ] -> Type.Int (max a b)
+  | [ Type.Int a; Type.Float b ] -> Type.Float (max (Int64.to_float a) b)
+  | [ Type.Float a; Type.Int b ] -> Type.Float (max a (Int64.to_float b))
+  | [ Type.Float a; Type.Float b ] -> Type.Float (max a b)
+  | _ -> raise (Runtime_error "Error calling max_fun")
 
 (* TODO (#2) Implement min: *)
-let min_fun = raise Not_implemented
-
+let min_fun = function
+  | [ Type.Int a; Type.Int b ] -> Type.Int (min a b)
+  | [ Type.Int a; Type.Float b ] -> Type.Float (min (Int64.to_float a) b)
+  | [ Type.Float a; Type.Int b ] -> Type.Float (min a (Int64.to_float b))
+  | [ Type.Float a; Type.Float b ] -> Type.Float (min a b)
+  | _ -> raise (Runtime_error "Error calling min_fun")
+           
 let not_fun = function
   | [ Type.Bool b ] -> Type.Bool (not b)
   | _ -> raise (Runtime_error "Invalid argument(s): expected boolean")
 
 (* TODO (#2) Implement null?: *)
-let is_null_fun = raise Not_implemented
+let is_null_fun = function
+  | [ Type.List a ] -> ( match a with
+      | [] -> Type.Bool true 
+      | _ -> Type.Bool false )
+  | _ -> Type.Bool false
 
 (* TODO (#2) Implement number?: *)
-let is_number_fun = raise Not_implemented
+let is_number_fun = function
+  | [ Type.Int _ ] -> Type.Bool true
+  | [ Type.Float _ ] -> Type.Bool true
+  | _ -> Type.Bool false
 
 (* TODO (#2) Implement procedure?  (hint: Type.Fun is the only type of procedure in MLisp): *)
-let is_procedure_fun = raise Not_implemented
+let is_procedure_fun = function
+  | [ Type.Fun _ ] -> Type.Bool true
+  | _ -> Type.Bool false
 
 let is_symbol_fun = function
   | [ Type.Symbol _ ] -> Type.Bool true
   | _ -> Type.Bool false
 
 (* TODO (#3a) Refactor add_fun, sub_fun, and div_fun into a single
- *            higher-order function *)
-let add_fun = function
-  | [ Type.Int a; Type.Int b ] -> Type.Int (Int64.add a b)
-  | _ -> raise (Runtime_error "Invalid argument(s): expected 2 numbers")
+*            higher-order function *) 
+  (* Need to pass in both int and float operation so that two int arguments
+   can be handled properly. Need division bool argument so we know if we should
+   actually be returning a float *)
+let arithmetic_fun int_operation float_operation isDivision = function
+  | [ Type.Int a; Type.Int b ] -> 
+      if isDivision then Type.Float (float_operation (Int64.to_float a) (Int64.to_float b))
+      else Type.Int (int_operation a b)
+  | [ Type.Int a; Type.Float b ] -> Type.Float (float_operation (Int64.to_float a) b) 
+  | [ Type.Float a; Type.Int b ] -> Type.Float (float_operation a (Int64.to_float b))
+  | [ Type.Float a; Type.Float b ] -> Type.Float (float_operation a b)
+  | _ -> raise (Runtime_error "Error calling arithmetic_fun")
+  
+           (*let add_fun = function
+               | [ Type.Int a; Type.Int b ] -> Type.Int (Int64.add a b)
+               | [ Type.Float a; Type.Float b ] -> Type.Float (Float.add a b)
+               | _ -> raise (Runtime_error "Invalid argument(s): expected 2 numbers")
 
-let sub_fun = function
-  | [ Type.Int a; Type.Int b ] -> Type.Int (Int64.sub a b)
-  | _ -> raise (Runtime_error "Invalid argument(s): expected 2 numbers")
+            let sub_fun = function
+              | [ Type.Int a; Type.Int b ] -> Type.Int (Int64.sub a b)
+              | [ Type.Float a; Type.Float b ] -> Type.Float (Float.sub a b) 
+              | _ -> raise (Runtime_error "Invalid argument(s): expected 2 numbers")
 
-let mult_fun = function
-  | [ Type.Int a; Type.Int b ] -> Type.Int (Int64.mul a b)
-  | _ -> raise (Runtime_error "Invalid argument(s): expected 2 numbers")
+            let mult_fun = function
+              | [ Type.Int a; Type.Int b ] -> Type.Int (Int64.mul a b)
+              | [ Type.Float a; Type.Float b ] -> Type.Float (Float.mul a b) 
+              | _ -> raise (Runtime_error "Invalid argument(s): expected 2 numbers")
 
-let div_fun = function
-  | [ Type.Int a; Type.Int b ] -> Type.Int (Int64.div a b)
-  | _ -> raise (Runtime_error "Invalid argument(s): expected 2 numbers")
+            let div_fun = function
+              | [ Type.Int a; Type.Int b ] -> Type.Int (Int64.div a b)
+              | [ Type.Float a; Type.Float b ] -> Type.Float (Float.div a b) 
+              | _ -> raise (Runtime_error "Invalid argument(s): expected 2 numbers")*)
 
-(* TODO (#3b) Refactor the following 4 functions into a single higher-order function *)
-let gt_fun = function
-  | [ Type.Int a; Type.Int b ] -> Type.Bool (a > b)
-  | [ Type.String a; Type.String b ] -> Type.Bool (a > b)
-  | _ ->
+(* TODO (#3b) Refactor the following 4 functions into a single higher-order function *) 
+(* Needs three separate functions because was having trouble with polymorphism *)
+let comparison_fun int_compare float_compare string_compare = function
+  | [ Type.Int a; Type.Int b ] -> Type.Bool (int_compare a b) 
+  | [ Type.Int a; Type.Float b ] -> Type.Bool (float_compare (Int64.to_float a) b) 
+  | [ Type.Float a; Type.Int b ] -> Type.Bool (float_compare a (Int64.to_float b))
+  | [ Type.Float a; Type.Float b ] -> Type.Bool (float_compare a b)
+  | [ Type.String a; Type.String b ] -> Type.Bool (string_compare a b)
+  | _ -> raise (Runtime_error "Error calling comparison_fun")
+  
+           (*let gt_fun = function
+               | [ Type.Int a; Type.Int b ] -> Type.Bool (a > b)
+               | [ Type.Float a; Type.Float b ] -> Type.Bool (a > b)
+               | [ Type.String a; Type.String b ] -> Type.Bool (a > b)
+               | _ ->
+                   raise
+                     (Runtime_error "Invalid argument(s): expected 2 numbers or 2 strings")
+
+            let lt_fun = function
+              | [ Type.Int a; Type.Int b ] -> Type.Bool (a < b)
+              | [ Type.Float a; Type.Float b ] -> Type.Bool (a < b) 
+              | [ Type.String a; Type.String b ] -> Type.Bool (a < b)
+              | _ ->
+                  raise
+                    (Runtime_error "Invalid argument(s): expected 2 numbers or 2 strings")
+
+            let ge_fun = function
+              | [ Type.Int a; Type.Int b ] -> Type.Bool (a >= b)
+              | [ Type.Float a; Type.Float b ] -> Type.Bool (a >= b) 
+              | [ Type.String a; Type.String b ] -> Type.Bool (a >= b)
+              | _ ->
+                  raise
+                    (Runtime_error "Invalid argument(s): expected 2 numbers or 2 strings")
+
+            let le_fun = function
+              | [ Type.Int a; Type.Int b ] -> Type.Bool (a <= b)
+              | [ Type.Float a; Type.Float b ] -> Type.Bool (a <= b) 
+              | [ Type.String a; Type.String b ] -> Type.Bool (a <= b)
+              | _ ->
       raise
-        (Runtime_error "Invalid argument(s): expected 2 numbers or 2 strings")
-
-let lt_fun = function
-  | [ Type.Int a; Type.Int b ] -> Type.Bool (a < b)
-  | [ Type.String a; Type.String b ] -> Type.Bool (a < b)
-  | _ ->
-      raise
-        (Runtime_error "Invalid argument(s): expected 2 numbers or 2 strings")
-
-let ge_fun = function
-  | [ Type.Int a; Type.Int b ] -> Type.Bool (a >= b)
-  | [ Type.String a; Type.String b ] -> Type.Bool (a >= b)
-  | _ ->
-      raise
-        (Runtime_error "Invalid argument(s): expected 2 numbers or 2 strings")
-
-let le_fun = function
-  | [ Type.Int a; Type.Int b ] -> Type.Bool (a <= b)
-  | [ Type.String a; Type.String b ] -> Type.Bool (a <= b)
-  | _ ->
-      raise
-        (Runtime_error "Invalid argument(s): expected 2 numbers or 2 strings")
+        (Runtime_error "Invalid argument(s): expected 2 numbers or 2 strings")*)
 
 (* end (#3) *)
 
@@ -314,21 +414,24 @@ let print_fun = function
   | _ -> raise (Runtime_error "Invalid argument(s): expected 1 expression")
 
 (* TODO (#5) Implment round: *)
-let round_fun = raise Not_implemented
+let round_fun = function
+  | [ Type.Float a ] -> Type.Int (Int64.of_int(truncate (a +. 0.5)))
+  | [ Type.Int a ] -> Type.Int a
+  | _ -> raise (Runtime_error "Error calling round_fun") 
 
 (* global environment *)
 let global_env =
   Env.init None
     [
-      ("+", Type.Fun add_fun);
-      ("-", Type.Fun sub_fun);
-      ("*", Type.Fun mult_fun);
-      ("/", Type.Fun div_fun);
+      ("+", Type.Fun (arithmetic_fun Int64.add Float.add false));
+      ("-", Type.Fun (arithmetic_fun Int64.sub Float.sub false));
+      ("*", Type.Fun (arithmetic_fun Int64.mul Float.mul false));
+      ("/", Type.Fun (arithmetic_fun Int64.div Float.div true));
       ("=", Type.Fun equal_fun);
-      (">", Type.Fun gt_fun);
-      ("<", Type.Fun lt_fun);
-      (">=", Type.Fun ge_fun);
-      ("<=", Type.Fun le_fun);
+      (">", Type.Fun (comparison_fun (fun x y -> x > y) (fun x y -> x > y) (fun x y -> x > y)));
+      ("<", Type.Fun (comparison_fun (fun x y -> x < y) (fun x y -> x < y) (fun x y -> x < y)));
+      (">=", Type.Fun (comparison_fun (fun x y -> x >= y) (fun x y -> x >= y) (fun x y -> x >= y)));
+      ("<=", Type.Fun (comparison_fun (fun x y -> x <= y) (fun x y -> x <= y) (fun x y -> x <= y))); 
       ("append", Type.Fun append_fun);
       ("apply", Type.Fun apply_fun);
       ("begin", Type.Fun (fun args -> List.hd (List.rev args)));
